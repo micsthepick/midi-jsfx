@@ -1,0 +1,200 @@
+desc: convert sound to midi (keeping overtones for now)
+
+import cookdsp.jsfx-inc
+
+
+in_pin:L
+in_pin:R
+out_pin:L out
+out_pin:R out
+
+slider1:threshold_min=0.05<0,49.75,0.025>note on threshold
+slider2:threshold_max=10.001<0.025,50.0,0.025>note saturation level
+slider3:a=0.5<0.25,2,0.025>intellegibility
+slider4:divisor=64<16,128,1>Divisor (per second)
+
+
+// here's the general idea
+// take the FFT of each block of samples
+// analyze the magnitude of each frequency bin (that is a peak)
+// if above programmable threshold, send midi on with velocity scaling
+// from that threshold to 1 (clipping may happen? do I care?)
+
+// some extra details
+// to more accurately aproximate the frequency that is actually in use,
+// look at the magnitude difference between the neighbouring bands, and use quadratic interpolation
+
+// not all bands will correspond to a midi frequency, so limit the search area.
+
+// 48000/128 = 375
+// 48000/64 = 750
+// 48000/32 = 1500
+
+@init
+SIZE = 8192;
+//HOP = 1500;
+
+// manually alloc the fft buffer(s) to ensure no funny business with boundary crossings
+buffer_FFT = 0;
+__memory_next = SIZE * 2;
+
+// now can safely memalloc without the fft buffers cossing the 65536 boundary
+buffer_input_L = memalloc(SIZE);
+buffer_input_R = memalloc(SIZE);
+whats_on_L = memalloc(128);
+whats_on_R = memalloc(128);
+window.buffer(SIZE*2);
+window.buffer_window(1);
+
+circ_buffer_pointer = 0;
+hop_counter = 0;
+
+function miditofftb(mid_n) (
+    (mtof(mid_n)/srate*SIZE+0.5)|0;
+);
+
+function fftbtomidi(fft_b) (
+    (max(0, min(127, ftom(fft_b*srate/SIZE)))+0.5)|0;
+);
+
+function get_L_from_fft(band) (
+    sqrt(sqr(buffer_FFT[2*(SIZE-band)] - buffer_FFT[2*band]) +
+    sqr(buffer_FFT[2*(SIZE-band)+1] - buffer_FFT[2*band+1]));
+);
+
+function get_R_from_fft(band) (
+    sqrt(sqr(buffer_FFT[2*(SIZE-band)+1] + buffer_FFT[2*band+1]) +
+    sqr(buffer_FFT[2*(SIZE-band)] + buffer_FFT[2*band]));
+);
+
+@slider
+midisend(0, $xb0, 10, 0);
+midisend(0, $xb1, 10, 127);
+threshold_max = max(threshold_max, threshold_min + 0.025);
+threshold_diff = threshold_max^a-threshold_min^a;
+HOP = srate/divisor;
+
+@sample
+function perform_fft(buf_pointer) (
+    // copy input to fft buffers
+    i = buf_pointer;
+    j = 0;
+    loop(SIZE-buf_pointer,
+        buffer_FFT[j] = buffer_input_L[i] * window.buffer_fread(j);
+        buffer_FFT[j+1] = buffer_input_R[i] * window.buffer_fread(j);
+        i += 1;
+        j += 2;
+    );
+    i = 0;
+    loop(buf_pointer,
+        buffer_FFT[j] = buffer_input_L[i] * window.buffer_fread(j);
+        buffer_FFT[j+1] = buffer_input_R[i] * window.buffer_fread(j);
+        i += 1;
+        j += 2;
+    );
+
+    // perform FFT
+    fft(buffer_FFT, SIZE);
+    fft_permute(buffer_FFT, SIZE);
+
+    // ignore bands 0 and nyquist, they're too far
+    // start at miditofftb(20)-1 and go to miditofftb(127)
+    // (minus one to help with quadratic interpolation)
+    // i.e. set some reaasonable bounds
+    band = max(0, miditofftb(0)-1);
+    band_limit = min(SIZE/2-2, miditofftb(127)+1);
+    loop(band_limit - band,
+        // check if current band is a peak and should
+        // generate a note
+
+        // first get three values
+        L_0 = get_L_from_fft(band);
+        L_1 = get_L_from_fft(band+1);
+        L_2 = get_L_from_fft(band+2);
+        R_0 = get_R_from_fft(band);
+        R_1 = get_R_from_fft(band+1);
+        R_2 = get_R_from_fft(band+2);
+
+        // default to 0 velocity
+        L_velocity = 0;
+        R_velocity = 0;
+
+        // check for peak at L:
+        L_0 < L_1 && L_1 >= L_2 ? (
+            // generate x = -b/2a
+            // a + b + c = _2
+            // a - b + c = _0
+            // c = *_1
+            // a = (_0 + _2)*0.5 - *_1
+            // b = (_0 - _2)*0.5
+            // -b/2a = (_0 - _2)*0.5 / (_0 + _2 + 2 * _1)
+            correction = (L_0 - L_2) * 0.5 / (L_0 + L_2 + 2* L_1);
+            mid_band_L = fftbtomidi(band + 1 + correction);
+            // y = a x x + b x + c
+            corrected_L_1 = 0.5 * (L_0 + L_2 + 2* L_1) * sqr(correction) + 0.5 * (L_0 - L_2) * correction + L_1;
+            L_velocity = (max(0, min(1, (corrected_L_1^a-threshold_min^a)/threshold_diff))*127.999)|0;
+        );
+
+        // check for peak at L:
+        R_0 < R_1 && R_1 >=R_2 ? (
+            // generate x = -b/2a
+            // a + b + c = _2
+            // a - b + c = _0
+            // c = *_1
+            // a = (_0 + _2)*0.5 - *_1
+            // b = (_0 - _2)*0.5
+            // -b/2a = (_0 - _2)*0.5 / (_0 + _2 + 2 * _1)
+            correction = (R_0 - R_2) * 0.5 / (R_0 + R_2 + 2* R_1);
+            mid_band_R = fftbtomidi(band + 1 + correction);
+            // y = a x x + b x + c
+            corrected_R_1 = 0.5 * (R_0 + R_2 + 2* R_1) * sqr(correction) + 0.5 * (R_0 - R_2) * correction + R_1;
+            R_velocity = (max(0, min(1, (corrected_R_1^a-threshold_min^a)/threshold_diff))*127.999)|0;
+        );
+
+        // todo: handle multiple peaks on same mid_band
+
+        L_velocity > 0 ? (
+            whats_on_L[mid_band_L] = 2;
+            midisend(0, $x90, mid_band_L, L_velocity);
+        );
+        R_velocity > 0 ? (
+            whats_on_R[mid_band_R] = 2;
+            midisend(0, $x91, mid_band_R, R_velocity);
+        );
+        band += 1;
+    );
+    mid_band = 0;
+    loop(128,
+        whats_on_L[mid_band] > 0.5 ? (
+            // if has been on:
+            whats_on_L[mid_band] -= 1;
+            whats_on_L[mid_band] < 0.5 ? (
+                midisend(0, $x80, mid_band, 0);
+            );
+        );
+        whats_on_R[mid_band] > 0.5 ? (
+            // if has been on:
+            whats_on_R[mid_band] -= 1;
+            whats_on_R[mid_band] < 0.5 ? (
+                midisend(0, $x81, mid_band, 0);
+            );
+        );
+        mid_band += 1;
+    );
+);
+
+// write samples
+buffer_input_L[circ_buffer_pointer] = spl0 / sqrt(SIZE);
+buffer_input_R[circ_buffer_pointer] = spl1 / sqrt(SIZE);
+
+hop_counter += 1;
+hop_counter >= HOP ? (
+    hop_counter = 0;
+
+    perform_fft(circ_buffer_pointer);
+);
+
+circ_buffer_pointer += 1;
+circ_buffer_pointer %= SIZE;
+spl0 = 0;
+spl1 = 0;
