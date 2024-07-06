@@ -8,11 +8,10 @@ in_pin:R
 out_pin:L out
 out_pin:R out
 
-slider1:threshold_min=0.05<0,49.75,0.025>note on threshold
-slider2:threshold_max=10.001<0.025,50.0,0.025>note saturation level
-slider3:a=0.5<0.25,2,0.025>intellegibility
-slider4:divisor=32<16,128,1>Divisor (per second)
-
+slider1:divisor=32<16,128,1>Divisor (per second)
+slider2:saturation=10<0,10,0.025>note saturation level
+slider3:intell=4<-5,10,0.1>intellegibility
+slider4:curve=0.5<0,1,0.025>Curve
 
 // here's the general idea
 // take the FFT of each block of samples
@@ -67,11 +66,18 @@ function get_R_from_fft(band) (
     sqr(buffer_FFT[2*(SIZE-band)] + buffer_FFT[2*band]));
 );
 
+function get_velocity(coeff) (
+    lc = -log(coeff)+saturation;
+    bounded = max(0, min(1, lc*expintell));
+    ((bounded^expcurve)*127.999)|0;
+);
+
 @slider
 midisend(0, $xb0, 10, 0);
 midisend(0, $xb1, 10, 127);
 threshold_max = max(threshold_max, threshold_min + 0.025);
-threshold_diff = threshold_max^a-threshold_min^a;
+expintell = exp(-intell);
+expcurve = exp(-curve);
 HOP = srate/divisor;
 
 @sample
@@ -132,10 +138,10 @@ function perform_fft(buf_pointer) (
             mid_band_L = fftbtomidi(band + 1 + correction);
             // y = a x x + b x + c
             corrected_L_1 = 0.5 * (L_0 + L_2 + 2* L_1) * sqr(correction) + 0.5 * (L_0 - L_2) * correction + L_1;
-            L_velocity = (max(0, min(1, (corrected_L_1^a-threshold_min^a)/threshold_diff))*127.999)|0;
+            L_velocity = get_velocity(corrected_L_1);
         );
 
-        // check for peak at L:
+        // check for peak at R:
         R_0 < R_1 && R_1 >=R_2 ? (
             // generate x = -b/2a
             // a + b + c = _2
@@ -148,10 +154,10 @@ function perform_fft(buf_pointer) (
             mid_band_R = fftbtomidi(band + 1 + correction);
             // y = a x x + b x + c
             corrected_R_1 = 0.5 * (R_0 + R_2 + 2* R_1) * sqr(correction) + 0.5 * (R_0 - R_2) * correction + R_1;
-            R_velocity = (max(0, min(1, (corrected_R_1^a-threshold_min^a)/threshold_diff))*127.999)|0;
+            R_velocity = get_velocity(corrected_R_1);
         );
 
-        // todo: handle multiple peaks on same mid_band
+        // todo: handle multiple peaks on game mid_band
 
         L_velocity > 0 ? (
             whats_on_L[mid_band_L] = 2;
