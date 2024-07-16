@@ -1,4 +1,4 @@
-desc: convert sound to midi (keeping overtones for now)
+desc: convert sound to midi (mono L edition)
 
 import cookdsp.jsfx-inc
 
@@ -12,7 +12,7 @@ slider1:divisor=32<16,128,1>Divisor (per second)
 slider2:saturation=10<0,10,0.025>note saturation level
 slider3:intell=4<-5,10,0.1>intellegibility
 slider4:curve=0.5<0,1,0.025>Curve
-slider5:onthresh=0.5<0,5,0>Note on threshold
+slider5:onthresh=0.5<0,5,0.001>Note on threshold
 
 // here's the general idea
 // take the FFT of each block of samples
@@ -31,9 +31,9 @@ slider5:onthresh=0.5<0,5,0>Note on threshold
 // 48000/32 = 1500
 
 @init
-SIZE = 8192;
-LOW_BOUND = 25;
-POLYPHONY = 88;
+SIZE = 1024;
+LOW_BOUND = 0;
+POLYPHONY = 128;
 HIGH_BOUND = LOW_BOUND + POLYPHONY - 1;
 
 // manually alloc the fft buffer(s) to ensure no funny business with boundary crossings
@@ -42,11 +42,8 @@ __memory_next = SIZE * 2;
 
 // now can safely memalloc without the fft buffers cossing the 65536 boundary
 buffer_input_L = memalloc(SIZE);
-buffer_input_R = memalloc(SIZE);
 whats_on_L = memalloc(POLYPHONY);
-whats_on_R = memalloc(POLYPHONY);
 last_on_L = memalloc(POLYPHONY);
-last_on_R = memalloc(POLYPHONY);
 window.buffer(SIZE*2);
 window.buffer_window(1);
 
@@ -66,11 +63,6 @@ function get_L_from_fft(band) (
     sqr(buffer_FFT[2*(SIZE-band)+1] - buffer_FFT[2*band+1]));
 );
 
-function get_R_from_fft(band) (
-    sqrt(sqr(buffer_FFT[2*(SIZE-band)+1] + buffer_FFT[2*band+1]) +
-    sqr(buffer_FFT[2*(SIZE-band)] + buffer_FFT[2*band]));
-);
-
 function get_velocity(coeff) (
     lc = max(0, log(1+coeff)-exponthresh);
     bounded = max(0, min(1, lc*expintell));
@@ -78,8 +70,6 @@ function get_velocity(coeff) (
 );
 
 @slider
-midisend(0, $xb0, 10, 0);
-midisend(0, $xb1, 10, 127);
 threshold_max = max(threshold_max, threshold_min + 0.025);
 expintell = exp(-intell);
 expcurve = exp(-curve);
@@ -91,19 +81,20 @@ blockPos = 0;
 
 @sample
 function perform_fft(buf_pointer) (
+
     // copy input to fft buffers
     i = buf_pointer;
     j = 0;
     loop(SIZE-buf_pointer,
         buffer_FFT[j] = buffer_input_L[i] * window.buffer_fread(j);
-        buffer_FFT[j+1] = buffer_input_R[i] * window.buffer_fread(j);
+        buffer_FFT[j+1] = 0;
         i += 1;
         j += 2;
     );
     i = 0;
     loop(buf_pointer,
         buffer_FFT[j] = buffer_input_L[i] * window.buffer_fread(j);
-        buffer_FFT[j+1] = buffer_input_R[i] * window.buffer_fread(j);
+        buffer_FFT[j+1] = 0;
         i += 1;
         j += 2;
     );
@@ -117,7 +108,6 @@ function perform_fft(buf_pointer) (
     // (minus one to help with quadratic interpolation)
     // i.e. set some reaasonable bounds
     memset(whats_on_L, 0, POLYPHONY);
-    memset(whats_on_R, 0, POLYPHONY);
     band = max(0, miditofftb(LOW_BOUND)-1);
     band_limit = min(SIZE/2-2, miditofftb(HIGH_BOUND)+1);
     loop(band_limit - band,
@@ -128,13 +118,9 @@ function perform_fft(buf_pointer) (
         L_0 = get_L_from_fft(band);
         L_1 = get_L_from_fft(band+1);
         L_2 = get_L_from_fft(band+2);
-        R_0 = get_R_from_fft(band);
-        R_1 = get_R_from_fft(band+1);
-        R_2 = get_R_from_fft(band+2);
 
         // default to 0 velocity
         L_velocity = 0;
-        R_velocity = 0;
         
 
         // check for peak at L:
@@ -154,24 +140,7 @@ function perform_fft(buf_pointer) (
             // output if peak
             whats_on_L[mid_band_L] = L_velocity;
         );
-
-        // check for peak at R:
-        R_0 < R_1 && R_1 >= R_2 ? (
-            // generate x = -b/2a
-            // a + b + c = _2
-            // a - b + c = _0
-            // c = *_1
-            // a = (_0 + _2)*0.5 - *_1
-            // b = (_0 - _2)*0.5
-            // -b/2a = (_0 - _2)*0.5 / (_0 + _2 + 2 * _1)
-            correction = (R_0 - R_2) * 0.5 / (R_0 + R_2 + 2* R_1);
-            mid_band_R = fftbtomidi(band + 1 + correction) - LOW_BOUND;
-            // y = a x x + b x + c
-            corrected_R_1 = 0.5 * (R_0 + R_2 + 2* R_1) * sqr(correction) + 0.5 * (R_0 - R_2) * correction + R_1;
-            R_velocity = get_velocity(corrected_R_1);
-            // output if peak
-            whats_on_R[mid_band_R] = R_velocity;
-        );
+        
         band += 1;
     );
     band2 = 0;
@@ -180,24 +149,16 @@ function perform_fft(buf_pointer) (
         last_on_L[band2] >= 1 ? (
             midisend(blockPos, $x80, mid_band, 127);
         );
-        last_on_R[band2] >= 1 ? (
-            midisend(blockPos, $x81, mid_band, 127);
-        );
         whats_on_L[band2] >= 1 ? (
             midisend(blockPos, $x90, mid_band, whats_on_L[band2]);
-        );
-        whats_on_R[band2] >= 1 ? (
-            midisend(blockPos, $x91, mid_band, whats_on_R[band2]);
         );
         band2 += 1;
     );
     memcpy(last_on_L, whats_on_L, POLYPHONY);
-    memcpy(last_on_R, whats_on_R, POLYPHONY);
 );
 
 // write samples
-buffer_input_L[circ_buffer_pointer] = spl0 / sqrt(SIZE);
-buffer_input_R[circ_buffer_pointer] = spl1 / sqrt(SIZE);
+buffer_input_L[circ_buffer_pointer] = (spl0 + spl1) / sqrt(SIZE);
 
 hop_counter += 1;
 hop_counter >= HOP ? (
